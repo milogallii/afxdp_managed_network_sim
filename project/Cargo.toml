@@ -9,3 +9,25 @@ members = [
   "test/sender",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.95"
+hashbrown = "0.15.2"
+libc = "0.2.169"
+plotters = "0.3.7"
+pnet = "0.35.0"
+serde = { version = "1.0.217", features = ["serde_derive"] }
+toml = "0.8.19"
+xdrippi = "0.1.0"
+
+nmea = { path = "nmea" }
+packet_parser = { path = "packet_parser" }
+policy_handler = { path = "policy_handler" }
+ship = { path = "ship" }
+shipcomponent = { path = "shipcomponent" }

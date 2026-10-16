@@ -1,17 +1,33 @@
+use anyhow::{Context, Result};
 use nmea::Nmea;
 use packet_parser::PacketParser;
+use pnet::util::MacAddr;
+use std::os::fd::AsRawFd;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::{collections::VecDeque, os::fd::AsRawFd};
-use xdrippi::{utils::interface_name_to_index, BPFRedirectManager, Umem, UmemAllocator, XDPSocket};
-mod utils;
 use std::time::Instant;
+use std::{collections::VecDeque, net::Ipv4Addr};
+use xdrippi::{BPFRedirectManager, Umem, UmemAllocator, XDPSocket, utils::interface_name_to_index};
+mod utils;
 use utils::ship_component_stats::ShipComponentStats;
+
+/// An NMEA sentence that passed the ingress (sends) policy of its source component,
+/// waiting to be forwarded to the components that are allowed to receive it.
+#[derive(Debug)]
+pub struct FilteredPacket {
+    /// The raw Ethernet frame to reforge for every receiver.
+    pub data: Vec<u8>,
+    /// The "$TTSSS" / "!TTSSS" prefix (talker id + sentence type) used for policy matching.
+    pub prefix: String,
+}
 
 pub struct ShipComponent<'a> {
     pub name: String,
     pub ifname: String,
     pub mac: String,
     pub ip: String,
+    pub mac_addr: MacAddr,
+    pub ip_addr: Ipv4Addr,
     pub ifindex: libc::c_uint,
     pub bpf_manager: BPFRedirectManager,
     pub sock: XDPSocket<'a>,
@@ -23,6 +39,8 @@ pub struct ShipComponent<'a> {
 }
 
 impl ShipComponent<'_> {
+    /// Creates the AF_XDP socket for `ifname`, attaches the redirecting XDP program and
+    /// primes the umem fill ring.
     pub fn new(
         name: String,
         ifname: String,
@@ -30,23 +48,30 @@ impl ShipComponent<'_> {
         ip: String,
         sends: Vec<String>,
         receives: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let mac_addr = MacAddr::from_str(&mac)
+            .with_context(|| format!("[{name}] invalid MAC address '{mac}'"))?;
+        let ip_addr = Ipv4Addr::from_str(&ip)
+            .with_context(|| format!("[{name}] invalid IP address '{ip}'"))?;
+
         // Getting interface index
-        let ifindex = interface_name_to_index(ifname.as_str()).unwrap();
+        let ifindex = interface_name_to_index(ifname.as_str())
+            .with_context(|| format!("[{name}] network interface '{ifname}' does not exist"))?;
 
         // Setting up umem
-        let umem = Umem::new_4k(760000).unwrap();
+        let umem = Umem::new_4k(760000).context("failed to allocate UMEM")?;
         let umem = Arc::new(umem);
 
         // Setting up xsk
-        let mut sock = XDPSocket::new(ifindex, 0, umem.clone(), 4096).unwrap();
+        let mut sock = XDPSocket::new(ifindex, 0, umem.clone(), 4096)
+            .context("failed to create AF_XDP socket")?;
         let mut bpf_manager = BPFRedirectManager::attach(ifindex);
         bpf_manager.add_redirect(0, sock.as_raw_fd());
 
-        // setting up the memory allocator for the rings
+        // Setting up the memory allocator for the rings
         let umem_allocator = UmemAllocator::for_umem(umem.clone());
 
-        // setting up the fill ring
+        // Setting up the fill ring
         while let Some(chunk_index) = umem_allocator.try_allocate() {
             if sock.fill_ring.can_produce() {
                 sock.fill_ring
@@ -65,11 +90,13 @@ impl ShipComponent<'_> {
 
         let stats = ShipComponentStats::new();
 
-        ShipComponent {
+        Ok(ShipComponent {
             name,
             ifname,
             mac,
             ip,
+            mac_addr,
+            ip_addr,
             ifindex,
             bpf_manager,
             sock,
@@ -78,15 +105,33 @@ impl ShipComponent<'_> {
             sends,
             receives,
             stats,
-        }
+        })
     }
 
+    /// Returns the policy prefix of `message` if it is a valid NMEA sentence the component is
+    /// allowed to send, `None` otherwise. Non-NMEA traffic is denied by default.
+    pub fn allowed_prefix(sends: &[String], message: &str) -> Option<String> {
+        let mut nmea = Nmea::new();
+        nmea.parse(message).ok()?;
+
+        let prefix = format!(
+            "{}{}{}",
+            nmea.sentence_start(),
+            nmea.str_talker_id(),
+            nmea.str_sentence_type()
+        );
+
+        sends
+            .iter()
+            .any(|allowed| allowed == &prefix)
+            .then_some(prefix)
+    }
+
+    /// Consumes one frame from the RX ring, applies the send policy and queues the frame for
+    /// forwarding when it is allowed.
     pub fn consume_rx_ring(
         &mut self,
-        poll_fd_index: usize,
-        poll_fds_len: usize,
-        ship_traffic: &mut VecDeque<(usize, Vec<u8>, bool, String)>,
-        ship_switch: &mut hashbrown::HashMap<[u8; 6], usize>,
+        ship_traffic: &mut VecDeque<FilteredPacket>,
         start_time: Instant,
     ) {
         let rx_descriptor = self
@@ -99,39 +144,25 @@ impl ShipComponent<'_> {
             .rx_ring
             .get_nth_slice(self.sock.rx_ring.get_consumer_index() as _, &self.sock.umem);
 
-        //Parse the incoming message
-        let packet_parser = PacketParser::new(rx_slice);
-        let mut message_ok: bool = true;
-        let mut is_nmea: bool = false;
-        let mut prefix: String = String::from("NONMEA");
-
-        //trace stats
+        // Trace stats: everything the component emitted, before policy filtering.
         self.stats.total_bytes_sent += rx_slice.len() as f64;
         self.stats.performance_send.push((
             start_time.elapsed().as_secs_f64(),
-            ((self.stats.total_bytes_sent * 8.0) / start_time.elapsed().as_secs_f64()) / 1000000.0,
+            ((self.stats.total_bytes_sent * 8.0) / start_time.elapsed().as_secs_f64())
+                / 1_000_000.0,
         ));
 
-        match packet_parser.parse_traffic() {
-            Ok(message) => (message_ok, is_nmea, prefix) = self.apply_policy(message),
-            Err(_) => {}
-        }
-
-        if message_ok {
-            self.handle_network(
-                rx_slice,
-                ship_switch,
-                &poll_fd_index,
-                &poll_fds_len,
-                ship_traffic,
-                is_nmea,
-                prefix,
-            );
-        } else {
-            println!("|-- MESSAGE IS NOT A NMEA SENTENCE OR IS NOT ALLOWED ");
-            println!("|-- REC ALLOWED {:?}", self.receives);
-            println!("|-- SND ALLOWED {:?}", self.sends);
-            println!("----------------------------------------------------")
+        // Application layer firewall: only valid NMEA sentences explicitly allowed by the
+        // component's send policy are forwarded, everything else is dropped.
+        match PacketParser::new(rx_slice).parse_traffic() {
+            Ok(message) => match ShipComponent::allowed_prefix(&self.sends, message) {
+                Some(prefix) => ship_traffic.push_back(FilteredPacket {
+                    data: rx_slice.to_vec(),
+                    prefix,
+                }),
+                None => self.stats.dropped_frames += 1,
+            },
+            Err(_) => self.stats.dropped_frames += 1,
         }
 
         // refill allocator or fill ring
@@ -143,46 +174,6 @@ impl ShipComponent<'_> {
 
         // advance index
         self.sock.rx_ring.advance_consumer_index();
-    }
-
-    fn handle_network(
-        &self,
-        rx_slice: &[u8],
-        ship_switch: &mut hashbrown::HashMap<[u8; 6], usize>,
-        poll_fd_index: &usize,
-        poll_fds_len: &usize,
-        ship_traffic: &mut VecDeque<(usize, Vec<u8>, bool, String)>,
-        is_nmea: bool,
-        prefix: String,
-    ) {
-        // Update the ship switch and add the packets to the ship traffic
-        let eth_dst_addr: &[u8; 6] = &rx_slice[0..6].try_into().unwrap();
-        let eth_src_addr: &[u8; 6] = &rx_slice[6..12].try_into().unwrap();
-
-        // Add mac src address to the ship switch
-        if !ship_switch.contains_key(eth_src_addr) {
-            ship_switch.insert(*eth_src_addr, *poll_fd_index);
-            println!("SWITCH_STATUS:\n{:x?}", ship_switch);
-        }
-
-        if let Some(destination_poll_fd_index) = ship_switch.get(eth_dst_addr) {
-            ship_traffic.push_back((
-                *destination_poll_fd_index,
-                rx_slice.to_vec(),
-                is_nmea,
-                prefix,
-            ));
-        } else {
-            // nmea sentences should not be flooded since we want that only the correct recipients get what they expect
-            if !is_nmea {
-                for j in 0..*poll_fds_len {
-                    if *poll_fd_index == j {
-                        continue;
-                    }
-                    ship_traffic.push_back((j, rx_slice.to_vec(), is_nmea, prefix.clone()));
-                }
-            }
-        }
     }
 
     pub fn refill_umem_allocator(&mut self) {
@@ -208,26 +199,59 @@ impl ShipComponent<'_> {
             }
         }
     }
+}
 
-    fn apply_policy(&self, message: String) -> (bool, bool, String) {
-        // here we know that the message is udp and it should be parsed to check for nmea compliance
-        let mut nmea = Nmea::new();
-        let message_ok = nmea.parse(message.clone());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        match message_ok {
-            Ok(()) => {
-                // message is valid nmea
-                // now gotta check if the message can be sent by the component
-                // nmea.show();
-                let prefix = format!("${}{}", nmea.str_talker_id(), nmea.str_sentence_type());
-                let is_allowed = self
-                    .sends
-                    .iter()
-                    .any(|allowed_message| prefix == *allowed_message);
-                (is_allowed, true, prefix)
-            }
+    fn allowed_sends(prefix: &str) -> Vec<String> {
+        vec![String::from(prefix)]
+    }
 
-            Err(_) => (true, false, String::from("NONMEA")),
-        }
+    fn talker_sentence(body: &str) -> String {
+        let checksum = body.bytes().fold(0u8, |acc, byte| acc ^ byte);
+        format!("${}*{:02X}", body, checksum)
+    }
+
+    #[test]
+    fn allows_listed_nmea_sentence() {
+        let sends = allowed_sends("$IIHDT");
+        let message = talker_sentence("IIHDT,33,T");
+        assert_eq!(
+            ShipComponent::allowed_prefix(&sends, &message),
+            Some(String::from("$IIHDT"))
+        );
+    }
+
+    #[test]
+    fn denies_nmea_sentence_that_is_not_listed() {
+        let sends = allowed_sends("$IIHDT");
+        let message =
+            talker_sentence("GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,");
+        assert_eq!(ShipComponent::allowed_prefix(&sends, &message), None);
+    }
+
+    #[test]
+    fn denies_non_nmea_traffic_by_default() {
+        let sends = allowed_sends("$IIHDT");
+        assert_eq!(ShipComponent::allowed_prefix(&sends, "hello world"), None);
+        assert_eq!(
+            ShipComponent::allowed_prefix(&sends, "$IIHDT,33,T*44"),
+            None,
+            "sentence with an invalid checksum must be denied"
+        );
+    }
+
+    #[test]
+    fn allows_ais_prefix_for_encapsulated_sentences() {
+        let sends = allowed_sends("!AIVDM");
+        let body = "AIVDM,1,1,,A,15N:;R0P00PD;88MD5MTDwwD7k,0";
+        let checksum = body.bytes().fold(0u8, |acc, byte| acc ^ byte);
+        let message = format!("!{}*{:02X}", body, checksum);
+        assert_eq!(
+            ShipComponent::allowed_prefix(&sends, &message),
+            Some(String::from("!AIVDM"))
+        );
     }
 }

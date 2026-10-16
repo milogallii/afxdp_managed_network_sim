@@ -1,8 +1,11 @@
 [package]
 name = "policy_handler"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
-serde = { version = "1.0.217", features = ["serde_derive"] }
-toml = "0.8.19"
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
