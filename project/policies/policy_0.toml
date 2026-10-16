@@ -1,0 +1,51 @@
+[policy]
+c0 = { name = "girobussola", iface = "test1", mac = "54:00:00:00:00:10", ip = "10.42.0.10", sends = [
+  "$IIHDT",
+], receives = [
+] }
+c1 = { name = "ais", iface = "test2", mac = "54:00:00:00:00:20", ip = "10.42.0.20", sends = [
+  "!AIVDM",
+  "!AIVDO",
+], receives = [
+] }
+c2 = { name = "gps", iface = "test3", mac = "54:00:00:00:00:30", ip = "10.42.0.30", sends = [
+  "$GPGGA",
+  "$GPGLL",
+  "$GPRMC",
+], receives = [
+] }
+c3 = { name = "ecoscandaglio", iface = "test4", mac = "54:00:00:00:00:40", ip = "10.42.0.40", sends = [
+  "$IIDPT",
+], receives = [
+] }
+c4 = { name = "velocita", iface = "test5", mac = "54:00:00:00:00:50", ip = "10.42.0.50", sends = [
+  "$IIVHW",
+], receives = [
+] }
+c5 = { name = "radar", iface = "test6", mac = "54:00:00:00:00:60", ip = "10.42.0.60", sends = [
+  "$RATTM",
+  "$RATLL",
+  "$RAZDA",
+], receives = [
+  "$IIHDT",
+  "!AIVDM",
+  "$GPGGA",
+  "$GPGLL",
+  "$GPRMC",
+  "$IIDPT",
+  "$IIVHW",
+] }
+c6 = { name = "ecdis", iface = "test7", mac = "54:00:00:00:00:70", ip = "10.42.0.70", sends = [
+], receives = [
+  "$IIHDT",
+  "!AIVDM",
+  "!AIVDO",
+  "$GPGGA",
+  "$GPGLL",
+  "$GPRMC",
+  "$IIDPT",
+  "$IIVHW",
+  "$RATTM",
+  "$RATLL",
+  "$RAZDA",
+] }

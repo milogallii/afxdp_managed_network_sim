@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "simulation",
+  "ship",
+  "shipcomponent",
+  "policy_handler",
+  "packet_parser",
+  "nmea",
+  "test/sender",
+]
+resolver = "2"

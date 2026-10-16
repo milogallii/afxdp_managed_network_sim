@@ -1,0 +1,9 @@
+[package]
+name = "simulation"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shipcomponent = { path = "../shipcomponent" }
+ship = { path = "../ship" }
+policy_handler = { path = "../policy_handler" }
